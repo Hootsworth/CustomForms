@@ -1,0 +1,1096 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Firebase Forms</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Inter Font -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide-react@0.395.0/dist/lucide.min.js"></script>
+    <!-- Firebase SDK -->
+    <script type="module">
+        // Import Firebase services
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { 
+            getAuth, 
+            signInAnonymously, 
+            onAuthStateChanged,
+            signInWithCustomToken
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { 
+            getFirestore, 
+            doc, 
+            getDoc, 
+            addDoc, 
+            setDoc, 
+            updateDoc, 
+            deleteDoc, 
+            onSnapshot, 
+            collection, 
+            query, 
+            getDocs,
+            serverTimestamp,
+            setLogLevel
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { 
+            getStorage, 
+            ref, 
+            uploadBytesResumable, 
+            getDownloadURL 
+        } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-storage.js";
+
+        // --- GLOBAL APP STATE ---
+        let db, auth, storage;
+        let currentUserId = null;
+        let currentFormId = null;
+        let currentForm = null; // Holds the form being edited
+        let userForms = []; // List of the user's forms
+        let currentResponses = []; // Holds responses for the active form
+
+        // --- FIREBASE CONFIG (WILL BE POPULATED BY ENVIRONMENT) ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : { apiKey: "DEMO", authDomain: "DEMO", projectId: "DEMO" };
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // --- PATH HELPERS ---
+        const paths = {
+            privateFormCollection: (userId) => `artifacts/${appId}/users/${userId}/forms`,
+            privateFormDoc: (userId, formId) => `artifacts/${appId}/users/${userId}/forms/${formId}`,
+            publicFormCollection: () => `artifacts/${appId}/public/data/forms`,
+            publicFormDoc: (formId) => `artifacts/${appId}/public/data/forms/${formId}`,
+            publicResponseCollection: (formId) => `artifacts/${appId}/public/data/forms/${formId}/responses`,
+            publicUploadsRef: (formId, fileName) => `artifacts/${appId}/public/data/forms/${formId}/uploads/${fileName}`
+        };
+
+        // --- INITIALIZATION ---
+        async function initialize() {
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                storage = getStorage(app);
+                setLogLevel('Debug');
+                setupAuthListener();
+            } catch (error) {
+                console.error("Firebase initialization failed:", error);
+                showPage('error-page');
+                document.getElementById('error-message').textContent = "Failed to initialize. Please try again.";
+            }
+        }
+
+        function setupAuthListener() {
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    currentUserId = user.uid;
+                    document.getElementById('user-id-display').textContent = `User ID: ${currentUserId}`;
+                    await router(); // Route to the correct page after auth
+                } else {
+                    // No user, attempt to sign in
+                    await signIn();
+                }
+            });
+        }
+
+        async function signIn() {
+            try {
+                showPage('loading-page');
+                if (initialAuthToken) {
+                    await signInWithCustomToken(auth, initialAuthToken);
+                } else {
+                    await signInAnonymously(auth);
+                }
+                // onAuthStateChanged will handle the successful sign-in
+            } catch (error) {
+                console.error("Authentication failed:", error);
+                showPage('error-page');
+                document.getElementById('error-message').textContent = "Authentication failed. Please refresh.";
+            }
+        }
+
+        // --- ROUTING ---
+        async function router() {
+            const hash = window.location.hash || '#home';
+            showPage('loading-page');
+
+            if (!currentUserId) {
+                await signIn();
+                return; // Wait for auth to complete
+            }
+
+            if (hash === '#home') {
+                await loadHomePage();
+            } else if (hash.startsWith('#edit/')) {
+                currentFormId = hash.split('/')[1];
+                await loadEditorPage(currentFormId);
+            } else if (hash.startsWith('#view/')) {
+                currentFormId = hash.split('/')[1];
+                await loadViewerPage(currentFormId);
+            } else if (hash.startsWith('#responses/')) {
+                currentFormId = hash.split('/')[1];
+                await loadResponsesPage(currentFormId);
+            } else {
+                window.location.hash = '#home';
+            }
+        }
+
+        window.onhashchange = router;
+        window.onload = () => {
+            initialize();
+            setupIconObserver();
+        };
+        
+        // --- PAGE LOADERS ---
+
+        // HOME PAGE: List user's forms
+        async function loadHomePage() {
+            const formsCollectionRef = collection(db, paths.privateFormCollection(currentUserId));
+            const formsListEl = document.getElementById('forms-list');
+            formsListEl.innerHTML = '<p class="text-gray-500">Loading your forms...</p>';
+            
+            try {
+                // Use onSnapshot for real-time updates
+                onSnapshot(query(formsCollectionRef), (snapshot) => {
+                    userForms = [];
+                    snapshot.forEach(doc => {
+                        userForms.push({ id: doc.id, ...doc.data() });
+                    });
+                    renderFormsList();
+                    showPage('home-page');
+                }, (error) => {
+                    console.error("Error listening to forms:", error);
+                    formsListEl.innerHTML = '<p class="text-red-500">Could not load forms.</p>';
+                });
+            } catch (error) {
+                console.error("Error fetching forms:", error);
+                formsListEl.innerHTML = '<p class="text-red-500">Error fetching forms.</p>';
+            }
+        }
+
+        function renderFormsList() {
+            const formsListEl = document.getElementById('forms-list');
+            if (userForms.length === 0) {
+                formsListEl.innerHTML = '<p class="text-gray-500 text-center py-10">You haven\'t created any forms yet.</p>';
+                return;
+            }
+            formsListEl.innerHTML = userForms.map(form => `
+                <div class="bg-white border border-gray-200 rounded-lg p-4 flex justify-between items-center shadow-sm hover:shadow-md transition-shadow">
+                    <span class="font-medium text-gray-800">${form.title || 'Untitled Form'}</span>
+                    <div class="flex gap-2">
+                        <a href="#edit/${form.id}" class="text-sm bg-indigo-600 text-white px-3 py-1.5 rounded-md font-medium hover:bg-indigo-700">Edit</a>
+                        <a href="#responses/${form.id}" class="text-sm bg-gray-600 text-white px-3 py-1.5 rounded-md font-medium hover:bg-gray-700">Responses</a>
+                        <button onclick="deleteForm('${form.id}')" class="text-sm bg-red-500 text-white px-3 py-1.5 rounded-md font-medium hover:bg-red-600">Delete</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // EDITOR PAGE: Build the form
+        async function loadEditorPage(formId) {
+            const formDocRef = doc(db, paths.privateFormDoc(currentUserId, formId));
+            try {
+                const docSnap = await getDoc(formDocRef);
+                if (docSnap.exists()) {
+                    currentForm = { id: docSnap.id, ...docSnap.data() };
+                    renderFormEditor();
+                    showPage('editor-page');
+                } else {
+                    console.error("Form not found.");
+                    alertModal("Error", "Form not found or you don't have permission to edit it.");
+                    window.location.hash = '#home';
+                }
+            } catch (error) {
+                console.error("Error loading form:", error);
+                alertModal("Error", "Could not load form.");
+                window.location.hash = '#home';
+            }
+        }
+        
+        function renderFormEditor() {
+            if (!currentForm) return;
+
+            // Set up editor page elements
+            document.getElementById('editor-nav-responses-link').href = `#responses/${currentForm.id}`;
+            document.getElementById('editor-preview-link').href = `#view/${currentForm.id}`;
+            document.getElementById('form-title-input').value = currentForm.title || '';
+            document.getElementById('form-description-input').value = currentForm.description || '';
+            
+            const questionsContainer = document.getElementById('questions-container');
+            questionsContainer.innerHTML = '';
+            
+            if (!currentForm.questions || currentForm.questions.length === 0) {
+                currentForm.questions = [];
+                addQuestion(); // Add one default question if empty
+            }
+
+            currentForm.questions.forEach((question, index) => {
+                questionsContainer.appendChild(createQuestionEditorElement(question, index));
+            });
+            updateIconState();
+        }
+
+        function createQuestionEditorElement(question, index) {
+            const el = document.createElement('div');
+            el.className = 'bg-white p-6 rounded-lg border border-gray-200 shadow-sm mb-4';
+            el.dataset.index = index;
+            
+            const optionsHTML = ['multiple-choice', 'checkboxes', 'dropdown'].includes(question.type) ? `
+                <div class="mt-4 space-y-2" id="options-container-${index}">
+                    ${question.options.map((option, optIndex) => `
+                        <div class="flex items-center group">
+                            <input type="text" value="${option}" oninput="updateQuestionOption(${index}, ${optIndex}, this.value)" class="flex-1 text-sm p-2 border-b-2 border-gray-200 focus:border-indigo-500 outline-none">
+                            <button onclick="removeQuestionOption(${index}, ${optIndex})" class="ml-2 text-gray-400 hover:text-red-600 opacity-0 group-hover:opacity-100 transition-opacity">
+                                <i data-lucide="x" class="w-4 h-4"></i>
+                            </button>
+                        </div>
+                    `).join('')}
+                </div>
+                <button onclick="addQuestionOption(${index})" class="mt-2 text-sm text-indigo-600 font-medium hover:text-indigo-800">Add option</button>
+            ` : '';
+
+            el.innerHTML = `
+                <div class="flex justify-between items-start">
+                    <input type="text" value="${question.title}" oninput="updateQuestionProperty(${index}, 'title', this.value)" placeholder="Question Title" class="text-lg font-medium flex-1 p-2 border-b-2 border-gray-200 focus:border-indigo-500 outline-none">
+                    <select onchange="updateQuestionProperty(${index}, 'type', this.value)" class="ml-4 p-2 border border-gray-300 rounded-md">
+                        <option value="short-answer" ${question.type === 'short-answer' ? 'selected' : ''}>Short Answer</option>
+                        <option value="paragraph" ${question.type === 'paragraph' ? 'selected' : ''}>Paragraph</option>
+                        <option value="multiple-choice" ${question.type === 'multiple-choice' ? 'selected' : ''}>Multiple Choice</option>
+                        <option value="checkboxes" ${question.type === 'checkboxes' ? 'selected' : ''}>Checkboxes</option>
+                        <option value="dropdown" ${question.type === 'dropdown' ? 'selected' : ''}>Dropdown</option>
+                        <option value="file-upload" ${question.type === 'file-upload' ? 'selected' : ''}>File Upload</option>
+                    </select>
+                </div>
+                
+                ${optionsHTML}
+                
+                <hr class="my-4">
+                
+                <div class="flex justify-end items-center gap-4">
+                    <label class="flex items-center text-sm text-gray-600 cursor-pointer">
+                        <input type="checkbox" ${question.required ? 'checked' : ''} onchange="updateQuestionProperty(${index}, 'required', this.checked)" class="mr-2 h-4 w-4 rounded text-indigo-600 focus:ring-indigo-500 border-gray-300">
+                        Required
+                    </label>
+                    <button onclick="deleteQuestion(${index})" class="text-gray-500 hover:text-red-600">
+                        <i data-lucide="trash-2" class="w-5 h-5"></i>
+                    </button>
+                </div>
+            `;
+            return el;
+        }
+
+        // VIEWER PAGE: Respond to the form
+        async function loadViewerPage(formId) {
+            const formDocRef = doc(db, paths.publicFormDoc(formId));
+            try {
+                const docSnap = await getDoc(formDocRef);
+                if (docSnap.exists()) {
+                    const form = { id: docSnap.id, ...docSnap.data() };
+                    renderFormViewer(form);
+                    showPage('viewer-page');
+                } else {
+                    console.error("Public form not found.");
+                    alertModal("Error", "This form does not exist or has not been published.");
+                    window.location.hash = '#home';
+                }
+            } catch (error) {
+                console.error("Error loading public form:", error);
+                alertModal("Error", "Could not load this form.");
+                window.location.hash = '#home';
+            }
+        }
+
+        function renderFormViewer(form) {
+            document.getElementById('viewer-title').textContent = form.title || 'Untitled Form';
+            document.getElementById('viewer-description').textContent = form.description || '';
+            const questionsContainer = document.getElementById('viewer-questions-container');
+            questionsContainer.innerHTML = '';
+            
+            form.questions.forEach((question, index) => {
+                questionsContainer.appendChild(createQuestionViewerElement(question, index));
+            });
+            updateIconState();
+        }
+
+        function createQuestionViewerElement(question, index) {
+            const el = document.createElement('div');
+            el.className = 'bg-white p-6 rounded-lg border border-gray-200 shadow-sm mb-4';
+            
+            let inputHTML = '';
+            const inputId = `q-${index}`;
+            const requiredStar = question.required ? '<span class="text-red-500 ml-1">*</span>' : '';
+
+            switch(question.type) {
+                case 'short-answer':
+                    inputHTML = `<input type="text" id="${inputId}" name="${inputId}" ${question.required ? 'required' : ''} class="mt-2 w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">`;
+                    break;
+                case 'paragraph':
+                    inputHTML = `<textarea id="${inputId}" name="${inputId}" ${question.required ? 'required' : ''} rows="4" class="mt-2 w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500"></textarea>`;
+                    break;
+                case 'multiple-choice':
+                    inputHTML = `<div class="mt-2 space-y-2">
+                        ${question.options.map((option, optIndex) => `
+                            <label class="flex items-center">
+                                <input type="radio" id="${inputId}-${optIndex}" name="${inputId}" value="${option}" ${question.required ? 'required' : ''} class="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300">
+                                <span class="ml-3 text-gray-700">${option}</span>
+                            </label>
+                        `).join('')}
+                    </div>`;
+                    break;
+                case 'checkboxes':
+                    inputHTML = `<div class="mt-2 space-y-2">
+                        ${question.options.map((option, optIndex) => `
+                            <label class="flex items-center">
+                                <input type="checkbox" id="${inputId}-${optIndex}" name="${inputId}" value="${option}" class="h-4 w-4 text-indigo-600 focus:ring-indigo-500 border-gray-300 rounded">
+                                <span class="ml-3 text-gray-700">${option}</span>
+                            </label>
+                        `).join('')}
+                    </div>`;
+                    break;
+                case 'dropdown':
+                    inputHTML = `<select id="${inputId}" name="${inputId}" ${question.required ? 'required' : ''} class="mt-2 w-full p-2 border border-gray-300 rounded-md shadow-sm focus:ring-indigo-500 focus:border-indigo-500">
+                        <option value="">Select an option</option>
+                        ${question.options.map(option => `<option value="${option}">${option}</option>`).join('')}
+                    </select>`;
+                    break;
+                case 'file-upload':
+                    inputHTML = `<input type="file" id="${inputId}" name="${inputId}" ${question.required ? 'required' : ''} class="mt-2 w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-indigo-50 file:text-indigo-700 hover:file:bg-indigo-100">`;
+                    break;
+            }
+
+            el.innerHTML = `
+                <label class="text-base font-medium text-gray-900">${question.title || 'Untitled Question'}${requiredStar}</label>
+                ${inputHTML}
+            `;
+            return el;
+        }
+
+        // RESPONSES PAGE: View and export responses
+        async function loadResponsesPage(formId) {
+            // First, verify this user owns the form
+            const formDocRef = doc(db, paths.privateFormDoc(currentUserId, formId));
+            const docSnap = await getDoc(formDocRef);
+            if (!docSnap.exists()) {
+                alertModal("Access Denied", "You do not have permission to view these responses.");
+                window.location.hash = '#home';
+                return;
+            }
+            
+            // User is verified, now load responses from the public collection
+            currentForm = { id: docSnap.id, ...docSnap.data() }; // Load form def for CSV export
+            document.getElementById('responses-title').textContent = `Responses for: ${currentForm.title || 'Untitled Form'}`;
+            document.getElementById('responses-nav-edit-link').href = `#edit/${formId}`;
+
+            const responsesCollectionRef = collection(db, paths.publicResponseCollection(formId));
+            const responsesContainer = document.getElementById('responses-list-container');
+            responsesContainer.innerHTML = '<p class="text-gray-500">Loading responses...</p>';
+
+            try {
+                onSnapshot(query(responsesCollectionRef), (snapshot) => {
+                    currentResponses = [];
+                    snapshot.forEach(doc => {
+                        currentResponses.push({ id: doc.id, ...doc.data() });
+                    });
+                    renderResponsesList();
+                    showPage('responses-page');
+                }, (error) => {
+                    console.error("Error listening to responses:", error);
+                    responsesContainer.innerHTML = '<p class="text-red-500">Could not load responses.</p>';
+                });
+            } catch (error) {
+                console.error("Error fetching responses:", error);
+                responsesContainer.innerHTML = '<p class="text-red-500">Error fetching responses.</p>';
+            }
+        }
+        
+        function renderResponsesList() {
+            const responsesContainer = document.getElementById('responses-list-container');
+            if (currentResponses.length === 0) {
+                responsesContainer.innerHTML = '<p class="text-gray-500 text-center py-10">No responses yet.</p>';
+                return;
+            }
+            
+            // Simple list view of individual responses
+            responsesContainer.innerHTML = currentResponses.map((response, index) => {
+                const submittedAt = response.submittedAt?.toDate ? response.submittedAt.toDate().toLocaleString() : 'Unknown time';
+                return `
+                    <div class="bg-white p-4 rounded-lg border border-gray-200 shadow-sm mb-3">
+                        <div class="flex justify-between items-center mb-2">
+                            <h4 class="font-semibold text-gray-800">Response ${index + 1}</h4>
+                            <span class="text-xs text-gray-500">${submittedAt}</span>
+                        </div>
+                        <ul class="space-y-2">
+                            ${Object.entries(response.answers).map(([qId, answer]) => {
+                                const question = currentForm.questions[qId];
+                                let displayAnswer = '';
+                                if (question.type === 'file-upload' && typeof answer === 'object' && answer.downloadURL) {
+                                    displayAnswer = `<a href="${answer.downloadURL}" target="_blank" class="text-indigo-600 hover:underline">${answer.fileName}</a>`;
+                                } else if (Array.isArray(answer)) {
+                                    displayAnswer = answer.join(', ');
+                                } else {
+                                    displayAnswer = answer;
+                                }
+                                
+                                return `
+                                <li class="text-sm">
+                                    <strong class="text-gray-600">${question.title}:</strong>
+                                    <span class="text-gray-800 ml-2">${displayAnswer}</span>
+                                </li>`;
+                            }).join('')}
+                        </ul>
+                    </div>
+                `;
+            }).join('');
+        }
+
+
+        // --- FORM ACTIONS (CRUD) ---
+
+        // Create a new form (from Home page)
+        window.createNewForm = async function() {
+            if (!currentUserId) {
+                alertModal("Error", "You must be signed in to create a form.");
+                return;
+            }
+            
+            const newForm = {
+                title: "Untitled Form",
+                description: "",
+                questions: [{
+                    title: "Untitled Question",
+                    type: "short-answer",
+                    required: false,
+                    options: []
+                }],
+                createdAt: serverTimestamp()
+            };
+            
+            try {
+                const formsCollectionRef = collection(db, paths.privateFormCollection(currentUserId));
+                const docRef = await addDoc(formsCollectionRef, newForm);
+                window.location.hash = `#edit/${docRef.id}`;
+            } catch (error) {
+                console.error("Error creating new form:", error);
+                alertModal("Error", "Could not create a new form.");
+            }
+        }
+
+        // Delete a form (from Home page)
+        window.deleteForm = async function(formId) {
+            // Use a custom modal for confirmation
+            showConfirmModal(
+                "Delete Form?",
+                "Are you sure you want to delete this form? This will also delete its public version and all responses. This action cannot be undone.",
+                async () => {
+                    try {
+                        // 1. Delete private form
+                        await deleteDoc(doc(db, paths.privateFormDoc(currentUserId, formId)));
+                        
+                        // 2. Delete public form (best effort)
+                        await deleteDoc(doc(db, paths.publicFormDoc(formId)));
+
+                        // 3. Delete responses subcollection (This is hard, skip for this demo)
+                        // In a real app, you'd need a Cloud Function to delete subcollections.
+                        
+                        console.log("Form deleted (private and public)");
+                        // onSnapshot on the home page will update the list automatically
+                    } catch (error) {
+                        console.error("Error deleting form:", error);
+                        alertModal("Error", "Could not delete form.");
+                    }
+                }
+            );
+        }
+
+        // Publish a form (from Editor page)
+        window.publishForm = async function() {
+            if (!currentForm) return;
+
+            // 1. Save the latest changes to the private form first
+            await saveForm();
+            
+            // 2. Copy the private form data to the public form document
+            const publicFormDocRef = doc(db, paths.publicFormDoc(currentForm.id));
+            try {
+                await setDoc(publicFormDocRef, {
+                    ...currentForm,
+                    publishedAt: serverTimestamp(),
+                    ownerId: currentUserId // Good to store for reference
+                });
+                
+                const shareLink = `${window.location.origin}${window.location.pathname}#view/${currentForm.id}`;
+                document.getElementById('share-link-input').value = shareLink;
+                showModal('share-modal');
+                
+            } catch (error) {
+                console.error("Error publishing form:", error);
+                alertModal("Error", "Could not publish form.");
+            }
+        }
+        
+        // Copy share link to clipboard
+        window.copyShareLink = function() {
+            const input = document.getElementById('share-link-input');
+            input.select();
+            input.setSelectionRange(0, 99999); // For mobile devices
+            try {
+                // Use execCommand as a fallback for clipboard API in iFrames
+                document.execCommand('copy');
+                alertModal("Copied!", "Link copied to clipboard.");
+            } catch (err) {
+                console.error('Failed to copy: ', err);
+                alertModal("Error", "Could not copy link. Please copy it manually.");
+            }
+        }
+
+        // --- FORM EDITOR LOGIC ---
+        
+        // Auto-save form on any change
+        let saveTimeout;
+        async function saveForm() {
+            if (!currentForm) return;
+            const formDocRef = doc(db, paths.privateFormDoc(currentUserId, currentForm.id));
+            try {
+                // Clean up any extra properties before saving
+                const dataToSave = {
+                    title: currentForm.title || "Untitled Form",
+                    description: currentForm.description || "",
+                    questions: currentForm.questions || [],
+                    updatedAt: serverTimestamp()
+                };
+                await setDoc(formDocRef, dataToSave, { merge: true });
+                console.log("Form auto-saved");
+            } catch (error) {
+                console.error("Error auto-saving form:", error);
+            }
+        }
+        
+        function debounceSave() {
+            clearTimeout(saveTimeout);
+            saveTimeout = setTimeout(saveForm, 1000); // Save 1 second after last change
+        }
+
+        window.updateFormHeader = function(field, value) {
+            if (!currentForm) return;
+            currentForm[field] = value;
+            debounceSave();
+        }
+        
+        window.addQuestion = function() {
+            if (!currentForm) return;
+            currentForm.questions.push({
+                title: "New Question",
+                type: "short-answer",
+                required: false,
+                options: []
+            });
+            renderFormEditor();
+            debounceSave();
+        }
+
+        window.deleteQuestion = function(index) {
+            if (!currentForm) return;
+            currentForm.questions.splice(index, 1);
+            renderFormEditor();
+            debounceSave();
+        }
+
+        window.updateQuestionProperty = function(index, prop, value) {
+            if (!currentForm) return;
+            currentForm.questions[index][prop] = value;
+            
+            // If changing type, reset options if necessary
+            if (prop === 'type' && !['multiple-choice', 'checkboxes', 'dropdown'].includes(value)) {
+                currentForm.questions[index].options = [];
+            } else if (prop === 'type' && currentForm.questions[index].options.length === 0) {
+                 currentForm.questions[index].options = ["Option 1"];
+            }
+            
+            renderFormEditor(); // Re-render to show/hide options
+            debounceSave();
+        }
+        
+        window.addQuestionOption = function(qIndex) {
+            if (!currentForm) return;
+            currentForm.questions[qIndex].options.push(`Option ${currentForm.questions[qIndex].options.length + 1}`);
+            renderFormEditor();
+            debounceSave();
+        }
+
+        window.removeQuestionOption = function(qIndex, optIndex) {
+            if (!currentForm) return;
+            currentForm.questions[qIndex].options.splice(optIndex, 1);
+            renderFormEditor();
+            debounceSave();
+        }
+        
+        window.updateQuestionOption = function(qIndex, optIndex, value) {
+            if (!currentForm) return;
+            currentForm.questions[qIndex].options[optIndex] = value;
+            debounceSave(); // No need to re-render, just save
+        }
+        
+        // --- FORM SUBMISSION LOGIC ---
+        
+        window.submitForm = async function(event) {
+            event.preventDefault();
+            const form = event.target;
+            const formData = new FormData(form);
+            const answers = {};
+            let hasError = false;
+            
+            const submitButton = document.getElementById('viewer-submit-button');
+            submitButton.disabled = true;
+            submitButton.textContent = 'Submitting...';
+
+            const formDef = (await getDoc(doc(db, paths.publicFormDoc(currentFormId)))).data();
+
+            for (let i = 0; i < formDef.questions.length; i++) {
+                const question = formDef.questions[i];
+                const inputName = `q-${i}`;
+
+                if (question.type === 'checkboxes') {
+                    answers[i] = formData.getAll(inputName);
+                } else if (question.type === 'file-upload') {
+                    const file = formData.get(inputName);
+                    if (file && file.size > 0) {
+                        // File upload logic
+                        try {
+                            const uploadResult = await uploadFile(file);
+                            answers[i] = uploadResult;
+                        } catch (error) {
+                            console.error("File upload failed:", error);
+                            alertModal("Upload Error", `Failed to upload file: ${file.name}`);
+                            hasError = true;
+                        }
+                    } else if (question.required) {
+                        alertModal("Validation Error", `"${question.title}" is required.`);
+                        hasError = true;
+                    } else {
+                        answers[i] = null; // No file uploaded, not required
+                    }
+                } else {
+                    answers[i] = formData.get(inputName);
+                }
+
+                // Check required for non-file inputs
+                if (question.required && question.type !== 'file-upload') {
+                    const value = answers[i];
+                    if (!value || (Array.isArray(value) && value.length === 0)) {
+                        alertModal("Validation Error", `"${question.title}" is required.`);
+                        hasError = true;
+                    }
+                }
+            }
+            
+            if (hasError) {
+                submitButton.disabled = false;
+                submitButton.textContent = 'Submit';
+                return; // Stop submission
+            }
+            
+            // All good, save to Firestore
+            try {
+                const responsesCollectionRef = collection(db, paths.publicResponseCollection(currentFormId));
+                await addDoc(responsesCollectionRef, {
+                    answers: answers,
+                    submittedAt: serverTimestamp()
+                });
+                showPage('viewer-thanks-page');
+            } catch (error) {
+                console.error("Error submitting response:", error);
+                alertModal("Error", "Failed to submit response. Please try again.");
+                submitButton.disabled = false;
+                submitButton.textContent = 'Submit';
+            }
+        }
+        
+        async function uploadFile(file) {
+            return new Promise((resolve, reject) => {
+                const fileName = `${new Date().getTime()}_${file.name}`;
+                const storageRef = ref(storage, paths.publicUploadsRef(currentFormId, fileName));
+                const uploadTask = uploadBytesResumable(storageRef, file);
+
+                uploadTask.on('state_changed',
+                    (snapshot) => {
+                        // Can show progress here if needed
+                    },
+                    (error) => {
+                        reject(error);
+                    },
+                    async () => {
+                        // Upload completed successfully, now get the download URL
+                        const downloadURL = await getDownloadURL(uploadTask.snapshot.ref);
+                        resolve({
+                            fileName: file.name,
+                            fileType: file.type,
+                            fileSize: file.size,
+                            downloadURL: downloadURL
+                        });
+                    }
+                );
+            });
+        }
+
+
+        // --- CSV EXPORT ---
+        window.exportToCSV = function() {
+            if (!currentForm || !currentResponses) {
+                alertModal("Error", "No data to export.");
+                return;
+            }
+            
+            let csvContent = "";
+            
+            // 1. Create Header Row
+            const headers = ["SubmittedAt"];
+            currentForm.questions.forEach(q => {
+                headers.push(`"${q.title.replace(/"/g, '""')}"`);
+            });
+            csvContent += headers.join(',') + '\r\n';
+            
+            // 2. Create Data Rows
+            currentResponses.forEach(response => {
+                const row = [];
+                const submittedAt = response.submittedAt?.toDate ? response.submittedAt.toDate().toISOString() : 'N/A';
+                row.push(`"${submittedAt}"`);
+                
+                // Loop through questions in form order
+                for (let i = 0; i < currentForm.questions.length; i++) {
+                    const answer = response.answers[i];
+                    let cellValue = "";
+                    
+                    if (answer === null || typeof answer === 'undefined') {
+                        cellValue = "";
+                    } else if (Array.isArray(answer)) {
+                        cellValue = answer.join('; '); // For checkboxes
+                    } else if (typeof answer === 'object' && answer.downloadURL) {
+                        cellValue = answer.downloadURL; // For files
+                    } else {
+                        cellValue = String(answer);
+                    }
+                    
+                    row.push(`"${cellValue.replace(/"/g, '""')}"`);
+                }
+                csvContent += row.join(',') + '\r\n';
+            });
+            
+            // 3. Trigger Download
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            const fileName = `${currentForm.title.replace(/ /g, '_')}_responses.csv`;
+            link.setAttribute("download", fileName);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        }
+
+        // --- UI UTILITIES ---
+        const pages = ['loading-page', 'home-page', 'editor-page', 'viewer-page', 'responses-page', 'viewer-thanks-page', 'error-page'];
+        function showPage(pageId) {
+            pages.forEach(id => {
+                document.getElementById(id).classList.add('hidden');
+            });
+            document.getElementById(pageId).classList.remove('hidden');
+            window.scrollTo(0, 0); // Scroll to top on page change
+        }
+
+        function showModal(modalId) {
+            document.getElementById(modalId).classList.remove('hidden');
+        }
+        window.hideModal = function(modalId) {
+            document.getElementById(modalId).classList.add('hidden');
+        }
+
+        // Custom Alert Modal
+        function alertModal(title, message) {
+            document.getElementById('alert-modal-title').textContent = title;
+            document.getElementById('alert-modal-message').textContent = message;
+            showModal('alert-modal');
+        }
+        
+        // Custom Confirm Modal
+        let confirmCallback = null;
+        function showConfirmModal(title, message, onConfirm) {
+            document.getElementById('confirm-modal-title').textContent = title;
+            document.getElementById('confirm-modal-message').textContent = message;
+            confirmCallback = onConfirm;
+            showModal('confirm-modal');
+        }
+        
+        window.handleConfirm = function() {
+            if (confirmCallback) {
+                confirmCallback();
+            }
+            hideModal('confirm-modal');
+            confirmCallback = null;
+        }
+
+        // Lucide Icons replacement
+        function setupIconObserver() {
+            const observer = new MutationObserver((mutations) => {
+                updateIconState();
+            });
+            observer.observe(document.body, { childList: true, subtree: true });
+            updateIconState();
+        }
+
+        function updateIconState() {
+            if (window.lucide) {
+                window.lucide.createIcons();
+            }
+        }
+
+    </script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f3f4f6; /* gray-100 */
+        }
+        .app-page {
+            display: none; /* Hidden by default, JS will show */
+        }
+        .app-page:not(.hidden) {
+            display: block;
+        }
+        /* Custom scrollbar for options */
+        .options-container::-webkit-scrollbar {
+            width: 6px;
+        }
+        .options-container::-webkit-scrollbar-thumb {
+            background-color: #cbd5e1; /* gray-300 */
+            border-radius: 3px;
+        }
+        .options-container::-webkit-scrollbar-track {
+            background-color: #f1f5f9; /* gray-100 */
+        }
+    </style>
+</head>
+<body class="bg-gray-100">
+
+    <!-- Main App Container -->
+    <div class="min-h-screen">
+
+        <!-- LOADING PAGE -->
+        <div id="loading-page" class="app-page hidden">
+            <div class="flex items-center justify-center min-h-screen">
+                <div class="flex flex-col items-center">
+                    <svg class="animate-spin h-10 w-10 text-indigo-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
+                        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+                        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+                    </svg>
+                    <p class="mt-4 text-lg font-medium text-gray-700">Connecting to Firebase...</p>
+                    <span id="user-id-display" class="mt-2 text-xs text-gray-500"></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- ERROR PAGE -->
+        <div id="error-page" class="app-page hidden">
+             <div class="flex items-center justify-center min-h-screen">
+                <div class="bg-white p-8 rounded-lg shadow-md text-center">
+                    <i data-lucide="alert-triangle" class="w-12 h-12 text-red-500 mx-auto"></i>
+                    <h2 class="mt-4 text-2xl font-bold text-gray-800">An Error Occurred</h2>
+                    <p id="error-message" class="mt-2 text-gray-600">Something went wrong.</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- HOME PAGE (Form List) -->
+        <div id="home-page" class="app-page hidden">
+            <header class="bg-white shadow-sm border-b border-gray-200">
+                <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                    <h1 class="text-2xl font-bold text-gray-900">My Forms</h1>
+                    <button onclick="createNewForm()" class="bg-indigo-600 text-white px-4 py-2 rounded-md font-medium hover:bg-indigo-700 flex items-center gap-2">
+                        <i data-lucide="plus" class="w-5 h-5"></i>
+                        Create New Form
+                    </button>
+                </div>
+            </header>
+            <main class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <div id="forms-list" class="space-y-4">
+                    <!-- Forms list will be rendered here by JS -->
+                </div>
+            </main>
+        </div>
+
+        <!-- EDITOR PAGE -->
+        <div id="editor-page" class="app-page hidden">
+            <header class="bg-indigo-700 text-white">
+                <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
+                    <a href="#home" class="text-xl font-bold hover:opacity-80">Firebase Forms</a>
+                    <nav class="flex items-center gap-2">
+                        <a id="editor-nav-responses-link" href="#" class="px-3 py-1.5 rounded-md text-sm font-medium hover:bg-indigo-800">Responses</a>
+                        <button onclick="showModal('theme-modal')" class="p-2 rounded-full hover:bg-indigo-800">
+                            <i data-lucide="palette" class="w-5 h-5"></i>
+                        </button>
+                        <a id="editor-preview-link" href="#" target="_blank" class="p-2 rounded-full hover:bg-indigo-800">
+                            <i data-lucide="eye" class="w-5 h-5"></i>
+                        </a>
+                        <button onclick="publishForm()" class="bg-white text-indigo-700 px-4 py-2 rounded-md font-medium text-sm hover:bg-gray-100">
+                            Share
+                        </button>
+                    </nav>
+                </div>
+            </header>
+            <main class="max-w-3xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+                <!-- Form Header Editor -->
+                <div class="bg-white p-6 rounded-lg border-t-8 border-indigo-600 shadow-md mb-6">
+                    <input id="form-title-input" type="text" oninput="updateFormHeader('title', this.value)" placeholder="Form Title" class="text-3xl font-medium w-full p-2 border-b-2 border-gray-200 focus:border-indigo-500 outline-none">
+                    <textarea id="form-description-input" oninput="updateFormHeader('description', this.value)" placeholder="Form description" rows="2" class="mt-4 text-sm w-full p-2 border-b-2 border-gray-200 focus:border-indigo-500 outline-none resize-none"></textarea>
+                </div>
+                
+                <!-- Questions Container -->
+                <div id="questions-container" class="space-y-4">
+                    <!-- Question editor elements will be rendered here by JS -->
+                </div>
+                
+                <!-- Add Question Button -->
+                <div class="flex justify-center mt-6">
+                    <button onclick="addQuestion()" class="bg-white p-3 rounded-full shadow-lg border border-gray-200 hover:bg-gray-100 text-gray-600">
+                        <i data-lucide="plus" class="w-6 h-6"></i>
+                    </button>
+                </div>
+            </main>
+        </div>
+
+        <!-- VIEWER PAGE (Public Form) -->
+        <div id="viewer-page" class="app-page hidden">
+            <main class="max-w-2xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+                <form id="public-form" onsubmit="submitForm(event)">
+                    <!-- Form Header -->
+                    <div class="bg-white p-6 rounded-lg border-t-8 border-indigo-600 shadow-md mb-6">
+                        <h1 id="viewer-title" class="text-3xl font-medium text-gray-900"></h1>
+                        <p id="viewer-description" class="mt-4 text-gray-600"></p>
+                    </div>
+                    
+                    <!-- Viewer Questions Container -->
+                    <div id="viewer-questions-container" class="space-y-4">
+                        <!-- Question viewer elements will be rendered here by JS -->
+                    </div>
+                    
+                    <!-- Submit Button -->
+                    <div class="mt-6 flex justify-between items-center">
+                        <button id="viewer-submit-button" type="submit" class="bg-indigo-600 text-white px-6 py-2 rounded-md font-medium hover:bg-indigo-700 disabled:bg-indigo-300">
+                            Submit
+                        </button>
+                        <span class="text-sm text-gray-500">Powered by Firebase Forms</span>
+                    </div>
+                </form>
+            </main>
+        </div>
+
+        <!-- VIEWER THANKS PAGE -->
+        <div id="viewer-thanks-page" class="app-page hidden">
+            <main class="max-w-2xl mx-auto py-8 px-4 sm:px-6 lg:px-8">
+                <div class="bg-white p-8 rounded-lg border-t-8 border-indigo-600 shadow-md text-center">
+                    <i data-lucide="check-circle" class="w-16 h-16 text-green-500 mx-auto"></i>
+                    <h1 class="mt-6 text-3xl font-medium text-gray-900">Response Submitted</h1>
+                    <p class="mt-4 text-gray-600">Thank you! Your response has been recorded.</p>
+                    <a href="#" onclick="window.location.reload()" class="mt-6 inline-block text-indigo-600 hover:underline">Submit another response</a>
+                </div>
+            </main>
+        </div>
+        
+        <!-- RESPONSES PAGE -->
+        <div id="responses-page" class="app-page hidden">
+            <header class="bg-white shadow-sm border-b border-gray-200">
+                <div class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-4">
+                    <h1 id="responses-title" class="text-2xl font-bold text-gray-900">Responses</h1>
+                    <nav class="mt-2 flex items-center justify-between">
+                         <a id="responses-nav-edit-link" href="#" class="text-sm font-medium text-indigo-600 hover:text-indigo-800">
+                            &larr; Back to Editor
+                        </a>
+                        <button onclick="exportToCSV()" class="bg-green-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:bg-green-700 flex items-center gap-2">
+                            <i data-lucide="download" class="w-4 h-4"></i>
+                            Download .csv
+                        </button>
+                    </nav>
+                </div>
+            </header>
+            <main class="max-w-5xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+                <h3 class="text-xl font-semibold text-gray-800 mb-4">Individual Responses</h3>
+                <div id="responses-list-container" class="space-y-4">
+                    <!-- Responses list will be rendered here by JS -->
+                </div>
+            </main>
+        </div>
+
+    </div>
+    
+    <!-- MODALS -->
+    
+    <!-- Share Modal -->
+    <div id="share-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-lg shadow-xl max-w-md w-full">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-semibold text-gray-800">Form Published!</h3>
+                <button onclick="hideModal('share-modal')" class="text-gray-400 hover:text-gray-600">
+                    <i data-lucide="x" class="w-6 h-6"></i>
+                </button>
+            </div>
+            <p class="text-gray-600 mb-4">Your form is live. Share this link with responders:</p>
+            <div class="flex gap-2">
+                <input id="share-link-input" type="text" readonly class="flex-1 p-2 border border-gray-300 rounded-md bg-gray-50 text-sm">
+                <button onclick="copyShareLink()" class="bg-indigo-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:bg-indigo-700">
+                    Copy
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Theme Modal (Non-functional, placeholder) -->
+    <div id="theme-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full">
+            <div class="flex justify-between items-center mb-4">
+                <h3 class="text-xl font-semibold text-gray-800">Customize Theme</h3>
+                <button onclick="hideModal('theme-modal')" class="text-gray-400 hover:text-gray-600">
+                    <i data-lucide="x" class="w-6 h-6"></i>
+                </button>
+            </div>
+            <p class="text-gray-600">Theme customization (colors, fonts) would go here. This is a placeholder for now.</p>
+            <div class="mt-6 text-right">
+                <button onclick="hideModal('theme-modal')" class="bg-gray-200 text-gray-800 px-4 py-2 rounded-md font-medium text-sm hover:bg-gray-300">
+                    Close
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Alert Modal -->
+    <div id="alert-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full">
+            <h3 id="alert-modal-title" class="text-xl font-semibold text-gray-800">Alert</h3>
+            <p id="alert-modal-message" class="text-gray-600 mt-2 mb-6">This is an alert message.</p>
+            <div class="text-right">
+                <button onclick="hideModal('alert-modal')" class="bg-indigo-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:bg-indigo-700">
+                    OK
+                </button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Confirm Modal -->
+    <div id="confirm-modal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-lg shadow-xl max-w-sm w-full">
+            <h3 id="confirm-modal-title" class="text-xl font-semibold text-gray-800">Are you sure?</h3>
+            <p id="confirm-modal-message" class="text-gray-600 mt-2 mb-6">Please confirm this action.</p>
+            <div class="flex justify-end gap-2">
+                <button onclick="hideModal('confirm-modal')" class="bg-gray-200 text-gray-800 px-4 py-2 rounded-md font-medium text-sm hover:bg-gray-300">
+                    Cancel
+                </button>
+                <button onclick="handleConfirm()" class="bg-red-600 text-white px-4 py-2 rounded-md font-medium text-sm hover:bg-red-700">
+                    Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+
+</body>
+</html>
